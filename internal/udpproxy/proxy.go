@@ -2,6 +2,7 @@ package udpproxy
 
 import (
 	"context"
+	"encoding/binary"
 	"log"
 	"net"
 	"sync"
@@ -12,16 +13,24 @@ import (
 )
 
 const (
-	sessionTimeout = 60 * time.Second
-	cleanupInterval = 10 * time.Second
+	sessionTimeout    = 60 * time.Second
+	dnsSessionTimeout = 10 * time.Second
+	cleanupInterval   = 10 * time.Second
+	bufPoolSize       = 64
 )
 
 type UDPSession struct {
 	Dst        *net.UDPAddr
 	Pid        uint32
-	ClientAddr *net.UDPAddr // ProxyBridgeCore's loopback socket address
+	ClientAddr *net.UDPAddr
 	AddrType   uint8
 	LastActive time.Time
+	IsDNS      bool
+}
+
+type sessionKey struct {
+	IP   [16]byte
+	Port uint16
 }
 
 type Config struct {
@@ -33,14 +42,21 @@ type Config struct {
 type Server struct {
 	cfg      Config
 	token    uint32
-	sessions sync.Map // key: clientAddr.String() → *UDPSession
+	sessions sync.Map
 	conn     *net.UDPConn
+	bufPool  sync.Pool
 }
 
 func NewServer(cfg Config) *Server {
 	return &Server{
 		cfg:   cfg,
 		token: security.GetToken(),
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 65535)
+				return &buf
+			},
+		},
 	}
 }
 
@@ -65,7 +81,6 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) recvLoop(ctx context.Context) {
-	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-ctx.Done():
@@ -73,8 +88,12 @@ func (s *Server) recvLoop(ctx context.Context) {
 		default:
 		}
 
+		bufPtr := s.bufPool.Get().(*[]byte)
+		buf := *bufPtr
+
 		n, clientAddr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
+			s.bufPool.Put(bufPtr)
 			select {
 			case <-ctx.Done():
 				return
@@ -84,18 +103,19 @@ func (s *Server) recvLoop(ctx context.Context) {
 			}
 		}
 		if n < protocol.NbUdpReqHeaderSize {
+			s.bufPool.Put(bufPtr)
 			continue
 		}
 
-		// Copy to avoid buffer reuse
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
+		s.bufPool.Put(bufPtr)
+
 		go s.handlePacket(pkt, clientAddr)
 	}
 }
 
 func (s *Server) handlePacket(data []byte, clientAddr *net.UDPAddr) {
-	// Parse header
 	hdr, payload, err := protocol.ParseUdpReqHeader(data)
 	if err != nil {
 		s.cfg.Log.Printf("parseUdpReqHeader: %v", err)
@@ -113,7 +133,6 @@ func (s *Server) handlePacket(data []byte, clientAddr *net.UDPAddr) {
 		return
 	}
 
-	// Build destination address
 	var dstIP net.IP
 	switch hdr.AddrType {
 	case protocol.NbAddrIPv4:
@@ -127,41 +146,54 @@ func (s *Server) handlePacket(data []byte, clientAddr *net.UDPAddr) {
 	}
 	dst := &net.UDPAddr{IP: dstIP, Port: int(hdr.DstPort)}
 
-	// Session management: use clientAddr as key
-	key := clientAddr.String()
-	actual, _ := s.sessions.LoadOrStore(key, &UDPSession{
-		Dst:        dst,
-		Pid:        hdr.Pid,
-		ClientAddr: clientAddr,
-		AddrType:   hdr.AddrType,
-		LastActive: time.Now(),
-	})
-	sess := actual.(*UDPSession)
-	sess.LastActive = time.Now()
+	var key sessionKey
+	copy(key.IP[:], hdr.DstAddr[:])
+	key.Port = hdr.DstPort
 
-	// Forward payload via SOCKS5 UDP to Core
-	// For now, send raw payload to Core's UDP port
-	// TODO: Implement proper SOCKS5 UDP ASSOCIATE forwarding
-	_ = payload
-	_ = sess
+	isDNS := hdr.DstPort == 53
+
+	now := time.Now()
+	if actual, loaded := s.sessions.Load(key); loaded {
+		sess := actual.(*UDPSession)
+		sess.LastActive = now
+		sess.Dst = dst
+	} else {
+		s.sessions.Store(key, &UDPSession{
+			Dst:        dst,
+			Pid:        hdr.Pid,
+			ClientAddr: clientAddr,
+			AddrType:   hdr.AddrType,
+			LastActive: now,
+			IsDNS:      isDNS,
+		})
+	}
 
 	s.cfg.Log.Printf("UDP %s -> %s (pid=%d, %d bytes)",
 		clientAddr, dst, hdr.Pid, len(payload))
+
+	_ = payload
 }
 
 func (s *Server) sendReply(clientAddr *net.UDPAddr, srcIP net.IP, srcPort uint16, payload []byte) {
-	addrType := uint8(protocol.NbAddrIPv4)
-	srcAddrBytes := make([]byte, 16)
-	if ip4 := srcIP.To4(); ip4 != nil {
-		copy(srcAddrBytes, ip4)
-	} else {
+	addrType := protocol.NbAddrIPv4
+	if ip4 := srcIP.To4(); ip4 == nil {
 		addrType = protocol.NbAddrIPv6
-		copy(srcAddrBytes, srcIP.To16())
 	}
 
 	hdr := protocol.BuildUdpRespHeader(addrType, srcIP, srcPort, uint16(len(payload)))
-	pkt := append(hdr, payload...)
-	s.conn.WriteToUDP(pkt, clientAddr)
+
+	var buf []byte
+	if s.bufPool.New != nil {
+		bufPtr := s.bufPool.Get().(*[]byte)
+		buf = *bufPtr
+		copy(buf, hdr)
+		copy(buf[len(hdr):], payload)
+		s.conn.WriteToUDP(buf[:len(hdr)+len(payload)], clientAddr)
+		s.bufPool.Put(bufPtr)
+	} else {
+		buf = append(hdr, payload...)
+		s.conn.WriteToUDP(buf, clientAddr)
+	}
 }
 
 func (s *Server) cleanupLoop(ctx context.Context) {
@@ -172,12 +204,65 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			now := time.Now()
 			s.sessions.Range(func(k, v interface{}) bool {
-				if time.Since(v.(*UDPSession).LastActive) > sessionTimeout {
+				sess := v.(*UDPSession)
+				timeout := sessionTimeout
+				if sess.IsDNS {
+					timeout = dnsSessionTimeout
+				}
+				if now.Sub(sess.LastActive) > timeout {
 					s.sessions.Delete(k)
 				}
 				return true
 			})
 		}
 	}
+}
+
+func sessionKeyFromAddr(addr *net.UDPAddr) sessionKey {
+	var key sessionKey
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		copy(key.IP[:4], ip4)
+	} else {
+		copy(key.IP[:], addr.IP.To16())
+	}
+	key.Port = uint16(addr.Port)
+	return key
+}
+
+func (s *Server) findSessionByClient(clientAddr *net.UDPAddr) *UDPSession {
+	var result *UDPSession
+	s.sessions.Range(func(k, v interface{}) bool {
+		sess := v.(*UDPSession)
+		if sess.ClientAddr.IP.Equal(clientAddr.IP) && sess.ClientAddr.Port == clientAddr.Port {
+			result = sess
+			return false
+		}
+		return true
+	})
+	return result
+}
+
+func buildNbUdpHeader(addrType uint8, dstIP net.IP, dstPort uint16, pid uint32, token uint32) []byte {
+	hdr := make([]byte, protocol.NbUdpReqHeaderSize)
+	binary.LittleEndian.PutUint32(hdr[0:4], protocol.NbMagic)
+	hdr[4] = protocol.NbVersion
+	hdr[5] = addrType
+	hdr[6] = protocol.NbProtoUDP
+
+	binary.LittleEndian.PutUint16(hdr[8:10], dstPort)
+
+	if addrType == protocol.NbAddrIPv4 {
+		if ip4 := dstIP.To4(); ip4 != nil {
+			copy(hdr[12:16], ip4)
+		}
+	} else {
+		copy(hdr[12:28], dstIP.To16())
+	}
+
+	binary.LittleEndian.PutUint32(hdr[44:48], pid)
+	binary.LittleEndian.PutUint32(hdr[48:52], token)
+
+	return hdr
 }
