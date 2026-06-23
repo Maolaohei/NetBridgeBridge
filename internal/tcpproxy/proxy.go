@@ -21,11 +21,19 @@ type Config struct {
 	Log       *log.Logger
 }
 
-// ConnPool manages a pool of pre-established SOCKS5 connections to Core.
+// pooledConn wraps a net.Conn that has completed SOCKS5 auth negotiation.
+// Only CONNECT needs to be sent per request.
+type pooledConn struct {
+	net.Conn
+	createdAt time.Time
+}
+
+// ConnPool manages a pool of pre-authenticated SOCKS5 connections to Core.
+// Auth negotiation (1 RTT) happens once at creation; only CONNECT is sent per request.
 type ConnPool struct {
 	coreAddr string
 	mu       sync.Mutex
-	conns    []net.Conn
+	conns    []pooledConn
 	maxSize  int
 }
 
@@ -33,42 +41,63 @@ func NewConnPool(coreAddr string, maxSize int) *ConnPool {
 	return &ConnPool{
 		coreAddr: coreAddr,
 		maxSize:  maxSize,
-		conns:    make([]net.Conn, 0, maxSize),
+		conns:    make([]pooledConn, 0, maxSize),
 	}
 }
 
-func (p *ConnPool) Get() (net.Conn, error) {
+// createConn establishes a TCP connection and performs SOCKS5 auth negotiation.
+func (p *ConnPool) createConn() (pooledConn, error) {
+	conn, err := net.DialTimeout("tcp", p.coreAddr, 5*time.Second)
+	if err != nil {
+		return pooledConn{}, fmt.Errorf("dial core: %w", err)
+	}
+
+	// SOCKS5 auth negotiation: no auth
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		conn.Close()
+		return pooledConn{}, fmt.Errorf("socks5 auth write: %w", err)
+	}
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		conn.Close()
+		return pooledConn{}, fmt.Errorf("socks5 auth read: %w", err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		conn.Close()
+		return pooledConn{}, fmt.Errorf("socks5 auth failed: %x", resp)
+	}
+
+	return pooledConn{Conn: conn, createdAt: time.Now()}, nil
+}
+
+func (p *ConnPool) Get() (pooledConn, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if len(p.conns) > 0 {
-		conn := p.conns[len(p.conns)-1]
+	// Reuse existing pre-authenticated connection
+	for len(p.conns) > 0 {
+		pc := p.conns[len(p.conns)-1]
 		p.conns = p.conns[:len(p.conns)-1]
-		// Verify connection is still alive
-		if conn != nil {
-			return conn, nil
+		// Reject connections older than 5 minutes (prevent stale auth state)
+		if time.Since(pc.createdAt) < 5*time.Minute {
+			return pc, nil
 		}
+		pc.Close()
 	}
 
-	// Create new connection
-	conn, err := net.DialTimeout("tcp", p.coreAddr, 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("dial core: %w", err)
-	}
-	return conn, nil
+	// Create new pre-authenticated connection
+	return p.createConn()
 }
 
-func (p *ConnPool) Put(conn net.Conn) {
-	if conn == nil {
-		return
-	}
+func (p *ConnPool) Put(pc pooledConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if len(p.conns) < p.maxSize {
-		p.conns = append(p.conns, conn)
+		p.conns = append(p.conns, pc)
 	} else {
-		conn.Close()
+		pc.Close()
 	}
 }
 
@@ -82,7 +111,7 @@ func NewServer(cfg Config) *Server {
 	return &Server{
 		cfg:   cfg,
 		token: security.GetToken(),
-		pool:  NewConnPool(cfg.CoreSocks, 8),
+		pool:  NewConnPool(cfg.CoreSocks, 16),
 	}
 }
 
@@ -137,53 +166,39 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// Get connection from pool
-	coreConn, err := s.pool.Get()
+	// Get pre-authenticated connection from pool
+	pc, err := s.pool.Get()
 	if err != nil {
 		s.cfg.Log.Printf("pool.Get: %v", err)
 		return
 	}
 
-	// SOCKS5 CONNECT to original destination
+	// SOCKS5 CONNECT to original destination (auth already done)
 	dst := hdr.DstHostPort()
-	if err := socks5Connect(coreConn, dst); err != nil {
+	if err := socks5ConnectOnly(pc.Conn, dst); err != nil {
 		s.cfg.Log.Printf("socks5 connect to %s: %v", dst, err)
-		coreConn.Close()
+		pc.Close()
 		return
 	}
 
-	s.cfg.Log.Printf("TCP %s:%d -> %s (pid=%d proc=%s)",
-		hdr.DstAddr[:4], hdr.DstPort, dst, hdr.Pid, hdr.ProcName)
+	s.cfg.Log.Printf("TCP :%d -> %s (pid=%d proc=%s)",
+		hdr.SrcPort, dst, hdr.Pid, hdr.ProcName)
 
 	// Bidirectional relay
 	done := make(chan struct{})
 	go func() {
-		io.Copy(coreConn, conn)
+		io.Copy(pc.Conn, conn)
 		close(done)
 	}()
-	io.Copy(conn, coreConn)
+	io.Copy(conn, pc.Conn)
 	<-done
 
-	coreConn.Close()
+	// Return connection to pool for reuse
+	s.pool.Put(pc)
 }
 
-// socks5Connect performs SOCKS5 handshake + CONNECT to target.
-func socks5Connect(conn net.Conn, target string) error {
-	// Auth negotiation: no auth
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return err
-	}
-
-	// Read server response
-	resp := make([]byte, 2)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return err
-	}
-	if resp[0] != 0x05 || resp[1] != 0x00 {
-		return fmt.Errorf("socks5 auth failed: %x", resp)
-	}
-
-	// Parse target address
+// socks5ConnectOnly sends SOCKS5 CONNECT on an already auth-negotiated connection.
+func socks5ConnectOnly(conn net.Conn, target string) error {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		return err
@@ -195,18 +210,16 @@ func socks5Connect(conn net.Conn, target string) error {
 	var addrBody []byte
 
 	if ip4 := ip.To4(); ip4 != nil {
-		addrType = 0x01 // IPv4
+		addrType = 0x01
 		addrBody = ip4
 	} else if ip6 := ip.To16(); ip6 != nil {
-		addrType = 0x04 // IPv6
+		addrType = 0x04
 		addrBody = ip6
 	} else {
-		// Domain name
 		addrType = 0x03
 		addrBody = append([]byte{byte(len(host))}, []byte(host)...)
 	}
 
-	// SOCKS5 CONNECT request
 	req := make([]byte, 0, 4+len(addrBody)+2)
 	req = append(req, 0x05, 0x01, 0x00, addrType)
 	req = append(req, addrBody...)
@@ -216,7 +229,6 @@ func socks5Connect(conn net.Conn, target string) error {
 		return err
 	}
 
-	// Read CONNECT response
 	connectResp := make([]byte, 10)
 	if _, err := io.ReadFull(conn, connectResp); err != nil {
 		return err

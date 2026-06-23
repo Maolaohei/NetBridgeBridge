@@ -107,8 +107,13 @@ func TestSocks5Connect_IPv4(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := socks5Connect(conn, "1.2.3.4:443"); err != nil {
-		t.Fatalf("socks5Connect: %v", err)
+	// Simulate auth negotiation
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+
+	if err := socks5ConnectOnly(conn, "1.2.3.4:443"); err != nil {
+		t.Fatalf("socks5ConnectOnly: %v", err)
 	}
 
 	select {
@@ -132,8 +137,12 @@ func TestSocks5Connect_IPv6(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := socks5Connect(conn, "[2001:db8::1]:8080"); err != nil {
-		t.Fatalf("socks5Connect: %v", err)
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+
+	if err := socks5ConnectOnly(conn, "[2001:db8::1]:8080"); err != nil {
+		t.Fatalf("socks5ConnectOnly: %v", err)
 	}
 
 	select {
@@ -155,8 +164,12 @@ func TestSocks5Connect_Domain(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := socks5Connect(conn, "example.com:80"); err != nil {
-		t.Fatalf("socks5Connect: %v", err)
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+
+	if err := socks5ConnectOnly(conn, "example.com:80"); err != nil {
+		t.Fatalf("socks5ConnectOnly: %v", err)
 	}
 
 	select {
@@ -205,7 +218,12 @@ func TestEndToEnd_TCP(t *testing.T) {
 				}
 				defer coreConn.Close()
 
-				if err := socks5Connect(coreConn, hdr.DstHostPort()); err != nil {
+				// Simulate auth
+				coreConn.Write([]byte{0x05, 0x01, 0x00})
+				authResp := make([]byte, 2)
+				io.ReadFull(coreConn, authResp)
+
+				if err := socks5ConnectOnly(coreConn, hdr.DstHostPort()); err != nil {
 					return
 				}
 
@@ -274,30 +292,30 @@ func TestConnPool_GetPut(t *testing.T) {
 
 	pool := NewConnPool(mock.addr(), 2)
 
-	// Get should create new connection
-	conn1, err := pool.Get()
+	// Get should create new connection (with SOCKS5 auth)
+	pc1, err := pool.Get()
 	if err != nil {
 		t.Fatalf("pool.Get: %v", err)
 	}
-	if conn1 == nil {
-		t.Fatal("pool.Get returned nil")
+	if pc1.Conn == nil {
+		t.Fatal("pool.Get returned nil conn")
 	}
 
 	// Put it back
-	pool.Put(conn1)
+	pool.Put(pc1)
 
 	// Get again — should reuse from pool
-	conn2, err := pool.Get()
+	pc2, err := pool.Get()
 	if err != nil {
 		t.Fatalf("pool.Get second: %v", err)
 	}
-	if conn2 != conn1 {
+	if pc2.Conn != pc1.Conn {
 		t.Error("pool did not reuse connection")
 	}
-	pool.Put(conn2)
+	pool.Put(pc2)
 
 	// Pool full — Put should close excess
-	pool.Put(conn1) // already in pool, this should close conn1
+	pool.Put(pc1) // already in pool, this should close pc1
 }
 
 func TestConnPool_GetNewConnection(t *testing.T) {
@@ -305,27 +323,27 @@ func TestConnPool_GetNewConnection(t *testing.T) {
 	defer mock.close()
 
 	pool := NewConnPool(mock.addr(), 1)
-	conn, err := pool.Get()
+	pc, err := pool.Get()
 	if err != nil {
 		t.Fatalf("pool.Get: %v", err)
 	}
-	pool.Put(conn)
+	pool.Put(pc)
 
 	// Fill the pool
-	conn2, _ := pool.Get()
-	pool.Put(conn2)
+	pc2, _ := pool.Get()
+	pool.Put(pc2)
 
 	// Pool is full, Get should create new
-	conn3, err := pool.Get()
+	pc3, err := pool.Get()
 	if err != nil {
 		t.Fatalf("pool.Get when full: %v", err)
 	}
-	pool.Put(conn3)
+	pool.Put(pc3)
 }
 
 func TestConnPool_PutNil(t *testing.T) {
 	pool := NewConnPool("127.0.0.1:9999", 2)
-	pool.Put(nil) // should not panic
+	pool.Put(pooledConn{}) // should not panic
 }
 
 // TestServer_Start tests that the server starts and accepts connections
@@ -544,13 +562,23 @@ func TestSocks5Connect_Failure(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		// Read auth
+		g := make([]byte, 2)
+		io.ReadFull(conn, g)
+		nm := make([]byte, g[1])
+		io.ReadFull(conn, nm)
 		conn.Write([]byte{0x05, 0x00})       // auth OK
 		conn.Write([]byte{0x05, 0x01, 0, 0, 0, 0, 0, 0, 0, 0}) // CONNECT failure
 	}()
 
 	conn, _ := net.Dial("tcp", ln.Addr().String())
 	defer conn.Close()
-	err := socks5Connect(conn, "1.2.3.4:443")
+	// Simulate auth
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+
+	err := socks5ConnectOnly(conn, "1.2.3.4:443")
 	if err == nil {
 		t.Error("expected error for CONNECT failure")
 	}
@@ -650,9 +678,9 @@ func TestSocks5Connect_AuthRequired(t *testing.T) {
 		conn.Write([]byte{0x05, 0x02}) // method 0x02 = username/password
 	}()
 
-	conn, _ := net.Dial("tcp", ln.Addr().String())
-	defer conn.Close()
-	err := socks5Connect(conn, "1.2.3.4:443")
+	// This should fail at auth negotiation (pool.createConn level)
+	pool := NewConnPool(ln.Addr().String(), 1)
+	_, err := pool.Get()
 	if err == nil {
 		t.Error("expected error for auth required")
 	}
