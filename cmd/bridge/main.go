@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	defaultTCPListen = "127.0.0.1:35000"
-	defaultUDPListen = "127.0.0.1:35001"
+	defaultTCPListen = "127.0.0.1:35002"
+	defaultUDPListen = "127.0.0.1:35003"
 	defaultCoreSocks = "127.0.0.1:10808"
 )
 
